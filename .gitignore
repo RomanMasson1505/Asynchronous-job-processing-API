@@ -1,0 +1,20 @@
+# Dossier de travail perso (notes, plan, guide) — pas dans le repo
+guide/
+
+# Binaires
+/bin/
+jobapi
+*.exe
+
+# Go
+*.test
+*.out
+coverage.*
+
+# OS / éditeurs
+.DS_Store
+.idea/
+.vscode/
+
+# Binaire produit par "go build ./cmd/server"
+/server
