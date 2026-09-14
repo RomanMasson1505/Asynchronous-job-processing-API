@@ -1,19 +1,18 @@
 # jobapi — Asynchronous job processing API
 
-Une API HTTP qui accepte des tâches, les met en file, et les fait exécuter en
-arrière-plan par un pool de goroutines. Le client n'attend pas : il reçoit un
-identifiant immédiatement et consulte l'état de son job quand il veut.
+An HTTP API that accepts tasks, queues them, and runs them in the background
+on a pool of goroutines. The client never waits: it gets an identifier
+immediately and checks its job's state whenever it wants.
 
-**Bibliothèque standard Go uniquement.** Aucune dépendance, aucun framework —
-`go.mod` ne contient pas une seule ligne `require`.
+**Go standard library only.** No dependencies, no framework — `go.mod` does not
+contain a single `require` line.
 
-## Pourquoi
+## Why
 
-Une requête HTTP synchrone est inadaptée à un travail qui dure : le client
-time-out, réessaie, et déclenche le même travail deux fois. La réponse
-classique est de découpler l'acceptation de l'exécution — c'est le motif
-derrière Celery, Sidekiq, BullMQ ou SQS + Lambda. Ce projet en implémente le
-cœur à la main.
+A synchronous HTTP request is the wrong shape for work that takes time: the
+client times out, retries, and triggers the same work twice. The classic answer
+is to decouple acceptance from execution — the pattern behind Celery, Sidekiq,
+BullMQ or SQS + Lambda. This project implements its core by hand.
 
 ## Architecture
 
@@ -21,64 +20,65 @@ cœur à la main.
                    HTTP
                     │
         ┌───────────▼───────────┐
-        │        api            │  routes net/http, encodage JSON
+        │        api            │  net/http routes, JSON encoding
         └─────┬───────────┬─────┘
               │ Create    │ Get / List / Cancel
         ┌─────▼───────────▼─────┐
         │        store          │  map[string]*Job + sync.RWMutex
-        │  (source de vérité)   │
+        │   (source of truth)   │
         └───────────▲───────────┘
                     │ Start / Finish
               ┌─────┴─────┐
-              │  worker   │  N goroutines lisant le channel
+              │  worker   │  N goroutines reading the channel
               └─────▲─────┘
                     │
-              chan string (IDs en attente)
+              chan string (queued IDs)
 ```
 
-`store` n'importe personne. `worker` importe `store`. `api` importe `store`.
-`main` câble le tout. Aucun cycle : chaque paquet se teste isolément.
+`store` imports nobody. `worker` imports `store`. `api` imports `store`.
+`main` wires it all together. No cycles: every package is testable in
+isolation.
 
-## Démarrer
+## Running it
 
 ```bash
-go run ./cmd/server      # écoute sur :8080
+go run ./cmd/server      # listens on :8080
 ```
 
 ## API
 
-| Méthode | Route | Réponse |
+| Method | Route | Response |
 |---|---|---|
-| `POST` | `/jobs` | `202` + le job à l'état `queued` |
-| `GET` | `/jobs/{id}` | `200` + le job, `404` si inconnu |
+| `POST` | `/jobs` | `202` + the job in the `queued` state |
+| `GET` | `/jobs/{id}` | `200` + the job, `404` if unknown |
 | `GET` | `/jobs?status=running` | `200` + `{count, jobs}` |
-| `DELETE` | `/jobs/{id}` | `200` si l'annulation est prise en compte, `404` si inconnu ou déjà terminé |
+| `DELETE` | `/jobs/{id}` | `200` if the cancellation was accepted, `404` if unknown or already finished |
 | `GET` | `/healthz` | `200` |
 
-Types de jobs livrés : `sleep` (payload `{"ms":5000}`) et `uppercase`
-(payload `{"text":"..."}`). En ajouter un se fait en une ligne dans
-`DefaultRegistry`, sans toucher au pool.
+Built-in job types: `sleep` (payload `{"ms":5000}`) and `uppercase`
+(payload `{"text":"..."}`). Adding one is a single line in `DefaultRegistry`,
+without touching the pool.
 
-### Exemple
+### Example
 
 ```bash
-# soumettre — la réponse est immédiate
+# submit — the response is immediate
 curl -X POST localhost:8080/jobs -d '{"type":"sleep","payload":{"ms":5000}}'
 # {"id":"4db8ed81757589f8","type":"sleep","status":"queued","created_at":"..."}
 
-# consulter
+# check on it
 curl localhost:8080/jobs/4db8ed81757589f8
 # {"id":"...","status":"running","started_at":"..."}
 
-# annuler
+# cancel it
 curl -X DELETE localhost:8080/jobs/4db8ed81757589f8
-# le job passe à "canceled" dès que le handler observe ctx.Done()
+# the job turns "canceled" as soon as the handler observes ctx.Done()
 
-# lister les jobs en cours
+# list the running jobs
 curl 'localhost:8080/jobs?status=running'
 ```
 
-Cycle de vie d'un job :
+A job's lifecycle:
 
 ```
 queued ──> running ──> succeeded
@@ -87,35 +87,35 @@ queued ──> running ──> succeeded
    └─────────────────> canceled
 ```
 
-## Points d'implémentation
+## Implementation notes
 
-- **Aucun pointeur interne ne sort du store.** Toute lecture rend un `Clone()`
-  réalisé sous verrou. Sans ça, un handler HTTP sérialiserait un job pendant
-  qu'un worker écrit dedans.
-- **`RWMutex`** : les lectures (nombreuses) sont concurrentes, seules les
-  écritures sont exclusives.
-- **File bufferisée** : `POST /jobs` n'attend jamais un worker. Si la file est
-  pleine, l'API répond `503` au lieu de bloquer la requête.
-- **Annulation coopérative** : `DELETE` déclenche le `context` du job ; c'est
-  au handler d'observer `ctx.Done()`. Rien n'est tué de force.
-- **Arrêt gracieux** : sur SIGINT/SIGTERM, on ferme d'abord le serveur HTTP
-  (plus aucune entrée), puis on ferme la file et on attend que les workers
-  aient terminé le travail déjà accepté.
+- **No internal pointer ever leaves the store.** Every read returns a `Clone()`
+  made under the lock. Without it, an HTTP handler could serialize a job while
+  a worker is writing to it.
+- **`RWMutex`**: reads (the common case) run concurrently, only writes are
+  exclusive.
+- **Buffered queue**: `POST /jobs` never waits for a worker. When the queue is
+  full, the API answers `503` instead of blocking the request.
+- **Cooperative cancellation**: `DELETE` triggers the job's `context`; it is up
+  to the handler to observe `ctx.Done()`. Nothing is killed by force.
+- **Graceful shutdown**: on SIGINT/SIGTERM, the HTTP server is closed first (no
+  new work comes in), then the queue is closed and we wait for the workers to
+  finish the work already accepted.
 
 ## Tests
 
 ```bash
-go test ./...           # tests unitaires par couche
-go test -race ./...     # + détecteur de data races
+go test ./...           # unit tests, layer by layer
+go test -race ./...     # + the data race detector
 ```
 
-Les tests HTTP utilisent `httptest` : aucun port n'est ouvert. Les tests du
-pool attendent un état par sondage court plutôt qu'avec un `Sleep` fixe, pour
-rester rapides sans devenir instables.
+The HTTP tests use `httptest`: no port is ever opened. The pool tests wait for
+a state by short polling rather than a fixed `Sleep`, which keeps them fast
+without making them flaky.
 
-## Limites assumées
+## Known limitations
 
-Le stockage est en mémoire : redémarrer perd les jobs. Comme toutes les
-écritures passent par les méthodes de `Store`, brancher Redis ou Postgres
-derrière la même interface ne toucherait aucun autre paquet. Il n'y a pas non
-plus de reprise sur erreur (retry) ni de priorités.
+Storage is in memory: restarting loses the jobs. Since every write goes through
+the `Store` methods, putting Redis or Postgres behind the same interface would
+not touch any other package. There is no retry on failure either, and no
+priorities.
